@@ -151,7 +151,7 @@ def get_acts_from_file(fpath, hps, vqvae, top_prior, meanpool=True, pool_frames_
     # For an input audio of shape [JUKEBOX_EXPECTED_SAMPLES_LEN,],
     # the activations have shape [T, 4800]. For shorter audio, the
     # activations have length proportional to len(audio)/JUKEBOX_EXPECTED_SAMPLES_LEN
-    acts = acts[:latent_audio_len, :]
+    acts = acts[:latent_audio_len, :] # 只取头23.77秒提取特征 1048576/44100，最后得到(240, 4800)的表示
 
     # postprocessing
     if meanpool:
@@ -195,7 +195,7 @@ def load_model(model="5b"):
 
     # Set up language model
     hparams = setup_hparams(priors[-1], dict())
-    hparams["prior_depth"] = 36
+    hparams["prior_depth"] = 72 # error when 36 layers, change it to 72
     top_prior = make_prior(hparams, vqvae, device)
     return hps, vqvae, top_prior
 
