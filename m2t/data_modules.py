@@ -636,8 +636,8 @@ def read_hf_dataset(
     # into separate datasets with fixed sampling probabilities (or, use the sampling
     # weights parameter in np.random.choice() to set it there.)
     urls = expand_url_to_file_list(url)
-    if is_train:
-        urls = repeat_shards(urls)
+    # if is_train:
+    #     urls = repeat_shards(urls)
 
     if urls[0].endswith(".jsonl") or urls[0].endswith(".json"):
         dataset = load_dataset("json", data_files=urls, split="train", streaming=True)
@@ -659,11 +659,12 @@ def read_hf_dataset(
     # At this point, each element is a dict mapping {str:List} where the values
     # are lists of length batch_size.
 
-    dataset = dataset.shuffle(buffer_size=_SHUFFLE_BUFFER_SIZE)
+    dataset = dataset.shuffle(buffer_size=_SHUFFLE_BUFFER_SIZE, seed=42)
 
-    dataset = dataset.map(_preprocess_multimodal, batched=False)
-    dataset = dataset.map(_preprocess_for_lm, batched=False)
-    dataset = dataset.map(hf_preprocess_encodings, batched=False)
+    dataset = dataset.map(_preprocess_multimodal, batched=False) # add <audio_start> 240*<audio_patch> <audio_end>
+    dataset = dataset.map(_preprocess_for_lm, batched=False) # add a prompt "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions." and "### Human:" and "### Assistant: "
+                                                            # create input_ids and labels for training, only calculate loss for the response of assistant
+    dataset = dataset.map(hf_preprocess_encodings, batched=False) # reshape audio encodings and transform it from list into tensor (may be already done in _preprocess_for_lm function)
 
     return dataset
 
@@ -690,14 +691,20 @@ def make_data_module(
     eval_dataset = None
 
     if data_args.train_data_path:
-        train_dataset = read_webdataset(
+        # train_dataset = read_webdataset(
+        #     data_args.train_data_path,
+        #     multimodal_cfg=multimodal_cfg,
+        #     tokenizer=tokenizer,
+        #     is_train=True,
+        #     task_sample_probs=data_args.task_sample_probs
+        #     if data_args.apply_task_sample_probs
+        #     else None,
+        # )
+        train_dataset = read_hf_dataset(
             data_args.train_data_path,
             multimodal_cfg=multimodal_cfg,
             tokenizer=tokenizer,
             is_train=True,
-            task_sample_probs=data_args.task_sample_probs
-            if data_args.apply_task_sample_probs
-            else None,
         )
 
     if data_args.eval_data_path:
