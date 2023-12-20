@@ -17,7 +17,7 @@ import pathlib
 
 import torch
 import transformers
-
+from transformers import get_scheduler
 from m2t.arguments import (
     DataArguments,
     ModelArguments,
@@ -45,16 +45,54 @@ from m2t.utils import (
     safe_save_model_for_hf_trainer,
     smart_tokenizer_and_embedding_resize,
 )
-
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+import deepspeed
+from .ds_utils import get_train_ds_config
+import math
+from deepspeed.utils import log_dist
+import deepspeed.comm as ds_comm
 # pandas must be imported before other packages to avoid
 # /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.29' not found
 
+def to_device(batch, device):
+    output = {}
+    for k, v in batch.items():
+        try:
+            output[k] = v.to(device)
+        except:
+            output[k] = v
+    return output
+
+def print_rank_0(msg='', **kwargs):
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        print(msg, **kwargs)
+
+
+def all_reduce_mean(tensor):
+    with torch.no_grad():
+        reduced_tensor = tensor.clone()
+        ds_comm.all_reduce(reduced_tensor)
+        return reduced_tensor / ds_comm.get_world_size()
 
 def train(
+    args,
     model_args: ModelArguments,
     data_args: DataArguments,
     training_args: TrainingArguments,
 ):
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    global_rank = int(os.environ.get("RANK", -1))
+    if local_rank == -1:
+        device = torch.device("cuda")
+    else:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        deepspeed.init_distributed()
+
     compute_dtype = get_compute_dtype(training_args)
 
     bnb_model_from_pretrained_args = get_bnb_model_args(training_args, compute_dtype)
@@ -252,29 +290,131 @@ def train(
     }
     logging.warning(f"sample batch collated info: {info}")
 
-    trainer = WrappedTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
+    train_dataset = data_module["train_dataset"]
+    
 
-    trainer.save_state()
+    train_dataloader = DataLoader(train_dataset,
+                                  collate_fn=data_module["data_collator"],
+                                  batch_size=training_args.per_device_train_batch_size)
 
-    if training_args.lora_enable:
-        state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            model.config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(
-                non_lora_state_dict,
-                os.path.join(training_args.output_dir, "non_lora_trainables.bin"),
-            )
-    else:
-        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    
+    AdamOptimizer = DeepSpeedCPUAdam if training_args.offload else FusedAdam
 
-    return dict(trainer=trainer, tokenizer=tokenizer, data_module=data_module)
+    optimizer = AdamOptimizer(model.parameters(),
+                              lr=training_args.learning_rate,
+                              betas=(0.9, 0.95))
+
+
+    lr_scheduler = get_scheduler(
+        name=training_args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=math.ceil(training_args.warmup_ratio * training_args.max_steps),
+        num_training_steps=training_args.max_steps,
+    )
+
+    ds_config = get_train_ds_config(args=training_args,
+                                    offload=training_args.offload,
+                                    stage=training_args.zero_stage,
+                                    steps_per_print=training_args.logging_steps,
+                                    )
+
+    ds_config[
+        'train_micro_batch_size_per_gpu'] = training_args.per_device_train_batch_size
+    ds_config[
+        'train_batch_size'] = training_args.per_device_train_batch_size * torch.distributed.get_world_size(
+    ) * training_args.gradient_accumulation_steps
+    ds_config["fp16"]["enabled"] = training_args.fp16
+    ds_config["bf16"]["enabled"] = training_args.bf16
+    # Note:
+    # optimizer and lr_scheduler are not necessarily specified in the config file.
+    model, optimizer, _, lr_scheduler = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        config=ds_config,
+        lr_scheduler=lr_scheduler,
+        dist_init_required=True)
+
+    # If exist checkpoint, resume from training
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    #num_micro_batches_per_epoch = len(train_dataloader)
+    for epoch in range(int(training_args.num_train_epochs)):
+
+        print_rank_0(
+            f"Beginning of Epoch {epoch + 1}/{training_args.num_train_epochs}"
+        )
+
+        model.train()
+
+        losses = []
+        #progress_bar = tqdm(range(num_micro_batches_per_epoch), disable=local_rank != 0)
+        global_steps = 0
+        for step, batch in enumerate(train_dataloader):
+            batch = to_device(batch, training_args.device)
+            if training_args.fp16: # todo: change the data type of audio encodings in dataset-level rather than batch-level
+                batch["audio_encodings"] = batch["audio_encodings"].to(torch.float16)
+            elif training_args.bf16:
+                batch["audio_encodings"] = batch["audio_encodings"].to(torch.bfloat16)
+            # print(batch["input_ids"].shape)
+            outputs = model(**batch, use_cache=False)
+            loss = outputs.loss
+            model.backward(loss)
+            model.step()
+            losses.append(loss)
+
+            if model.is_gradient_accumulation_boundary():
+                train_loss_this_step = sum(losses) / len(losses)
+                # 1. Logging
+                #if model.monitor.enabled:
+                if global_rank == 0 and local_rank == 0:
+                    global_steps += 1
+                    if global_steps % training_args.logging_steps == 0:
+                        log_dist(f"GlobalSteps: {global_steps} Loss: {train_loss_this_step:.3f}", ranks=[0])
+                losses = []
+
+                if global_steps > 0 and global_steps % training_args.save_steps == 0:
+                    # 1. reduce mean loss
+                    reduced_loss = all_reduce_mean(torch.tensor(train_loss_this_step).to(device)).item()
+
+                    # 2. saving checkpoint
+                    # 3. wait_for_everyone
+                    client_sd = dict()
+
+                    # Saving these stats in order to resume training
+                    client_sd['global_steps'] = global_steps
+                    client_sd['num_epoches'] = epoch
+
+                    ckpt_id = f"epoch{epoch}_iter{global_steps}_loss{reduced_loss:.3f}"
+
+
+                    model.save_checkpoint(training_args.output_dir, ckpt_id, client_state=client_sd)
+    # trainer = WrappedTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    #     trainer.train(resume_from_checkpoint=True)
+    # else:
+    #     trainer.train()
+
+    # trainer.save_state()
+
+    # if training_args.lora_enable:
+    #     state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
+    #     non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+    #     if training_args.local_rank == 0 or training_args.local_rank == -1:
+    #         model.config.save_pretrained(training_args.output_dir)
+    #         model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+    #         torch.save(
+    #             non_lora_state_dict,
+    #             os.path.join(training_args.output_dir, "non_lora_trainables.bin"),
+    #         )
+    # else:
+    #     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    # return dict(trainer=trainer, tokenizer=tokenizer, data_module=data_module)
 
 
 if __name__ == "__main__":
