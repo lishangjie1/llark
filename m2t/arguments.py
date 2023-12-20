@@ -100,6 +100,15 @@ class TrainingArguments(transformers.TrainingArguments):
         default="nf4",
         metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."},
     )
+    offload: bool = field(
+        default=False
+    )
+    wandb_enable: bool = field(
+        default=False
+    )
+    zero_stage: int = field(
+        default=0
+    )
     bits: int = field(default=16, metadata={"help": "How many bits to use."})
     lora_enable: bool = False
     lora_r: int = 64
